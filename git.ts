@@ -427,6 +427,57 @@ function buildV2Advertisement(): Buffer {
   ]);
 }
 
+/** v2 广告是常量：只建一次。 */
+const V2_ADVERTISEMENT: Buffer = buildV2Advertisement();
+
+/** refs 签名（排序后的 ref=oid 列表），供各类响应缓存做失效判断。 */
+function refsSignature(repo: Repo): string {
+  return [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([k, v]) => `${k}=${v}`)
+    .join(';');
+}
+
+/** v0 广告缓存：只随 service + refs + 对象数变化。 */
+const v0AdvCache = new WeakMap<Repo, Map<string, Buffer>>();
+function cachedV0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const key = `${service}|${refsSignature(repo)}|${repo.objects.size}`;
+  let map = v0AdvCache.get(repo);
+  if (map === undefined) {
+    map = new Map();
+    v0AdvCache.set(repo, map);
+  }
+  const hit = map.get(key);
+  if (hit !== undefined) return hit;
+  const body = buildV0Advertisement(repo, service);
+  if (map.size >= 8) {
+    const oldest = map.keys().next().value as string | undefined;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, body);
+  return body;
+}
+
+/** ls-refs 响应缓存：只随参数 + refs + 对象数变化。 */
+const lsRefsCache = new WeakMap<Repo, Map<string, Buffer>>();
+function cachedLsRefsV2(args: string[], repo: Repo): Buffer {
+  const key = `${args.join('|')}|${refsSignature(repo)}|${repo.objects.size}`;
+  let map = lsRefsCache.get(repo);
+  if (map === undefined) {
+    map = new Map();
+    lsRefsCache.set(repo, map);
+  }
+  const hit = map.get(key);
+  if (hit !== undefined) return hit;
+  const body = handleLsRefsV2(args, repo);
+  if (map.size >= 8) {
+    const oldest = map.keys().next().value as string | undefined;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, body);
+  return body;
+}
+
 // -------------------------------------------------------------------------------------------
 // fetch 规划：want 集合 − have 已持集合，带 shallow/deepen 边界
 // -------------------------------------------------------------------------------------------
@@ -650,7 +701,7 @@ function handleInfoRefs(
     return;
   }
   const wantsV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '') === 'version=2';
-  const body = wantsV2 ? buildV2Advertisement() : buildV0Advertisement(repo, service);
+  const body = wantsV2 ? V2_ADVERTISEMENT : cachedV0Advertisement(repo, service);
   const contentType =
     service === 'git-upload-pack'
       ? 'application/x-git-upload-pack-advertisement'
@@ -796,7 +847,7 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
     const command = (all.lines[0] as string).replace(/\n$/, '');
     const args = all.lines.slice(1);
     if (command === 'command=ls-refs') {
-      sendBuffer(res, 200, 'application/x-git-upload-pack-result', handleLsRefsV2(args, repo));
+      sendBuffer(res, 200, 'application/x-git-upload-pack-result', cachedLsRefsV2(args, repo));
       return;
     }
     if (command === 'command=fetch') {
