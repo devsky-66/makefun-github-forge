@@ -1,11 +1,19 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// The forge's HTTP server: one in-memory Store shared by all four surfaces.
+// main.ts is the entry <-> env lifecycle and stays as it is; this file wires the
+// handlers the three implementation groups delivered:
+//   git.ts       smart HTTP (upload-pack v2 / receive-pack v0)
+//   rest.ts      REST v3 under /api/v3
+//   graphql.ts   GraphQL v4 at /api/graphql
+//   mcp.ts       MCP (JSON-RPC 2.0 streamable HTTP) at /mcp
+// A handler returns true when it owned the request (and ended the response),
+// false when the path is not its own. Anything unclaimed is GitHub's 404 body.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleGit } from './git.ts';
+import { handleGraphql } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
+import { handleRest } from './rest.ts';
+import { Store } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -27,23 +35,34 @@ function pathOf(req: IncomingMessage): string {
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
+  const store = new Store();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
+    void (async () => {
+      try {
+        const path = pathOf(req);
+        const method = req.method ?? 'GET';
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
+        // The env's boot check calls this twice: 200 {"ok":true}.
+        if (method === 'GET' && path === '/healthz') {
+          sendJson(res, 200, { ok: true });
+          return;
+        }
 
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
+        if (await handleGit(req, res, store)) return;
+        if (await handleRest(req, res, store)) return;
+        if (await handleGraphql(req, res, store)) return;
+        if (await handleMcp(req, res, store)) return;
 
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+        // Everything else, every method: GitHub's 404 body.
+        sendJson(res, 404, { message: 'Not Found' });
+      } catch (err) {
+        // A handler must never take the server down: answer 500 once, if still possible.
+        try {
+          if (!res.writableEnded) sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
+        } catch {
+          // The socket is already gone; nothing left to do.
+        }
+      }
+    })();
   });
 }
