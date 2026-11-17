@@ -39,6 +39,17 @@ function sendErr(res: ServerResponse, store: Store, status: number, message: str
   send(res, store, status, { message });
 }
 
+/** 发送已序列化的 JSON 正文（issue GET 缓存命中时复用；头部与 send() 完全一致）。 */
+function sendRaw(res: ServerResponse, store: Store, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(text),
+    'x-github-request-id': store.nextRequestId(),
+    ...extraHeaders,
+  });
+  res.end(text);
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -599,6 +610,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           description: typeof body.description === 'string' ? body.description : '',
         };
         repo.labels.set(name, label);
+        repo.issueBodyCache.clear();
         send(res, store, 201, { ...labelJson(label), url: `${base}/labels/${encodeURIComponent(name)}` });
         return true;
       }
@@ -656,7 +668,9 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           }
         }
         const issue = store.createIssue(repo, title, typeof body.body === 'string' || body.body === null ? body.body : null, labels);
-        send(res, store, 201, issueJson(repo, issue));
+        const createdText = `${JSON.stringify(issueJson(repo, issue))}\n`;
+        repo.issueBodyCache.set(issue.number, createdText);
+        sendRaw(res, store, 201, createdText);
         return true;
       }
       if (rest.length === 2) {
@@ -671,7 +685,14 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           return true;
         }
         if (method === 'GET') {
-          send(res, store, 200, issueJson(repo, issue));
+          const cached = repo.issueBodyCache.get(n);
+          if (cached !== undefined) {
+            sendRaw(res, store, 200, cached);
+          } else {
+            const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+            repo.issueBodyCache.set(n, text);
+            sendRaw(res, store, 200, text);
+          }
           return true;
         }
         if (method === 'PATCH') {
@@ -699,6 +720,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
             issue.labels = labels;
           }
           issue.updated_at = store.nowIso();
+          repo.issueBodyCache.delete(n);
           send(res, store, 200, issueJson(repo, issue));
           return true;
         }
@@ -738,6 +760,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           list.push(comment);
           repo.issueComments.set(n, list);
           issue.comments = list.length;
+          repo.issueBodyCache.delete(n);
           send(res, store, 201, {
             id: comment.id, node_id: `IC_${comment.id}`, url: `${base}/issues/comments/${comment.id}`, html_url: `https://github.com/${OWNER_LOGIN}/${repo.name}/issues/${n}#issuecomment-${comment.id}`,
             body: comment.body, user: { login: OWNER_LOGIN, id: OWNER_ID, type: 'User', avatar_url: `https://avatars.githubusercontent.com/u/${OWNER_ID}?v=4`, html_url: `https://github.com/${OWNER_LOGIN}` },

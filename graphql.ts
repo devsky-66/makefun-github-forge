@@ -1174,6 +1174,7 @@ function mutateCloseIssue(args: Record<string, unknown>, ctx: ExecCtx): unknown 
   found.issue.state = 'closed';
   found.issue.closed_at = ctx.store.nowIso();
   found.issue.updated_at = ctx.store.nowIso();
+  (found.repo as unknown as { issueBodyCache?: Map<number, string> }).issueBodyCache?.delete(found.issue.number);
   return wrap('Payload', { fields: { issue: wrap('Issue', { repo: found.repo, issue: found.issue }), clientMutationId: clientMutationIdOf(input) } });
 }
 function mutateCreatePullRequest(args: Record<string, unknown>, ctx: ExecCtx): unknown {
@@ -1208,6 +1209,7 @@ function mutateAddComment(args: Record<string, unknown>, ctx: ExecCtx): unknown 
   if (typeof body !== 'string' || body === '') throw new GqlError('addComment: input.body is required.');
   const comment = addCommentToStore(ctx.store, found.repo, found.issue, body);
   found.issue.comments += 1;
+  (found.repo as unknown as { issueBodyCache?: Map<number, string> }).issueBodyCache?.delete(found.issue.number);
   const node = wrap('IssueComment', { id: comment.id, body: comment.body, authorLogin: 'adaiversen', createdAt: ctx.store.nowIso() });
   return wrap('Payload', { fields: { commentEdge: wrap('IssueCommentEdge', { node, cursor: encodeCursor(0) }), clientMutationId: clientMutationIdOf(input) } });
 }

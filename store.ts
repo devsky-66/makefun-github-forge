@@ -15,6 +15,8 @@ export interface Repo {
   issues: Issue[]; pulls: Pull[]; contents: Map<string, ContentEntry>;
   issueSeq: number; prSeq: number; issueByNumber: Map<number, Issue>; pullByNumber: Map<number, Pull>;
   issueComments: Map<number, IssueComment[]>;
+  /** GET 单 issue 的序列化响应缓存（body 固定不变时复用；PATCH/评论/label 变动时失效）。 */
+  issueBodyCache: Map<number, string>;
 }
 
 export const OWNER_LOGIN = 'adaiversen';
@@ -81,6 +83,7 @@ export class Store {
       issueByNumber: new Map(),
       pullByNumber: new Map(),
       issueComments: new Map(),
+      issueBodyCache: new Map(),
     };
     this.repoSeq += 1;
     this.repos.set(`${OWNER_LOGIN}/${name}`, repo);

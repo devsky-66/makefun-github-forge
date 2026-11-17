@@ -127,6 +127,16 @@ function packObjectHeader(type: GitObject['type'], size: number): Buffer {
   return Buffer.from(bytes);
 }
 
+/** zlib deflate 结果按输入 Buffer 身份缓存：git 对象内容不可变，压缩结果确定。 */
+const deflatedByData = new WeakMap<Buffer, Buffer>();
+function deflated(data: Buffer): Buffer {
+  const hit = deflatedByData.get(data);
+  if (hit !== undefined) return hit;
+  const out = deflateSync(data);
+  deflatedByData.set(data, out);
+  return out;
+}
+
 /** 无 delta 的 pack v2：调用方给的顺序即写盘顺序（这里按 oid 排，保证确定性）。 */
 export function buildPack(objects: readonly { type: GitObject['type']; data: Buffer }[]): Buffer {
   const header = Buffer.allocUnsafe(12);
@@ -136,7 +146,7 @@ export function buildPack(objects: readonly { type: GitObject['type']; data: Buf
   const parts: Buffer[] = [header];
   for (const object of objects) {
     parts.push(packObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflated(object.data));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -746,6 +756,32 @@ function parseFetchLines(lines: string[]): FetchRequest {
   return request;
 }
 
+/** fetch 完整响应按请求签名缓存：同一 repo、同一 refs/对象集、同一 want/have/depth 的 fetch 字节相同。对象只增不改，refs 全进签名，缓存不会过期读到旧数据。 */
+const fetchResponseCache = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 16;
+function fetchCacheKey(repo: Repo, isV2: boolean, request: FetchRequest): string {
+  const refs = [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([k, v]) => `${k}=${v}`)
+    .join(';');
+  return `${isV2 ? 'v2' : 'v0'}|${request.wants.join(',')}|${request.haves.join(',')}|${request.shallow.join(',')}|${request.depth ?? ''}|${refs}|${repo.objects.size}`;
+}
+function cachedFetch(repo: Repo, key: string): Buffer | undefined {
+  return fetchResponseCache.get(repo)?.get(key);
+}
+function storeFetch(repo: Repo, key: string, body: Buffer): void {
+  let map = fetchResponseCache.get(repo);
+  if (map === undefined) {
+    map = new Map();
+    fetchResponseCache.set(repo, map);
+  }
+  if (map.size >= FETCH_CACHE_MAX) {
+    const oldest = map.keys().next().value as string | undefined;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, body);
+}
+
 async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo): Promise<void> {
   const body = await readBody(req);
   const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
@@ -765,8 +801,14 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
     }
     if (command === 'command=fetch') {
       const request = parseFetchLines(args);
-      const plan = planFetch(repo, request.wants, request.haves, request.shallow, request.depth);
-      sendBuffer(res, 200, 'application/x-git-upload-pack-result', buildV2FetchResponse(plan));
+      const key = fetchCacheKey(repo, true, request);
+      let response = cachedFetch(repo, key);
+      if (response === undefined) {
+        const plan = planFetch(repo, request.wants, request.haves, request.shallow, request.depth);
+        response = buildV2FetchResponse(plan);
+        storeFetch(repo, key, response);
+      }
+      sendBuffer(res, 200, 'application/x-git-upload-pack-result', response);
       return;
     }
     sendText(res, 400, `unknown command ${command}`);
@@ -774,8 +816,14 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
   }
   // v0：want 区 + flush + have/done 区 + flush；pack 在第二个 flush 后无内容。
   const request = parseFetchLines(all.lines);
-  const plan = planFetch(repo, request.wants, request.haves, request.shallow, request.depth);
-  sendBuffer(res, 200, 'application/x-git-upload-pack-result', buildV0FetchResponse(plan));
+  const key = fetchCacheKey(repo, false, request);
+  let response = cachedFetch(repo, key);
+  if (response === undefined) {
+    const plan = planFetch(repo, request.wants, request.haves, request.shallow, request.depth);
+    response = buildV0FetchResponse(plan);
+    storeFetch(repo, key, response);
+  }
+  sendBuffer(res, 200, 'application/x-git-upload-pack-result', response);
 }
 
 /** 解码整段 pkt-line 流（不提前停在 flush 上），返回全部 data 行。 */
